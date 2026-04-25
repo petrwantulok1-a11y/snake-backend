@@ -4,18 +4,23 @@ const axios = require("axios");
 const cors = require("cors");
 
 const app = express();
-app.use(cors()); // Povolí Lovable připojit se k tvému API
+app.use(cors()); // Nutné pro propojení s Lovable
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 const DATA_FILE = "database.json";
 
-// Načtení dat (hráči + zpracované platby)
+// --- DATABÁZE (Souborová) ---
 function loadData() {
   if (!fs.existsSync(DATA_FILE)) {
+    // Startujeme s ID 888000001
     return { players: {}, processedTransactions: [], lastVsId: 888000000 };
   }
-  return JSON.parse(fs.readFileSync(DATA_FILE));
+  try {
+    return JSON.parse(fs.readFileSync(DATA_FILE));
+  } catch (e) {
+    return { players: {}, processedTransactions: [], lastVsId: 888000000 };
+  }
 }
 
 function saveData(data) {
@@ -24,58 +29,74 @@ function saveData(data) {
 
 let db = loadData();
 
-// --- FUNKCE PRO KONTROLU BANKY ---
+// --- LOGIKA BANKY (FIO API) ---
 async function checkFioBank() {
   const FIO_TOKEN = process.env.FIO_TOKEN;
   
   if (!FIO_TOKEN) {
-    console.log("⚠️ FIO_TOKEN není nastaven!");
+    console.log("⚠️ POZOR: FIO_TOKEN není nastaven v Environment Variables na Renderu!");
     return;
   }
 
   try {
-    console.log("🔍 Kontroluji bankovní účet...");
+    console.log("🔍 Kontroluji banku (Fio API)...");
+    // Používáme endpoint pro poslední pohyby
     const url = `https://www.fio.cz/ib_api/rest/last/${FIO_TOKEN}/transactions.json`;
     const response = await axios.get(url);
     
+    // Pokud nejsou žádné nové pohyby, API může vrátit prázdný objekt
     const transactions = response.data.accountStatement.transactionList.transaction;
 
-    if (!transactions || transactions.length === 0) return;
+    if (!transactions || transactions.length === 0) {
+      console.log("📭 Žádné nové platby k vyřízení.");
+      return;
+    }
 
     let changeMade = false;
 
     transactions.forEach(t => {
+      // column22 = ID pohybu, column8 = Variabilní symbol, column1 = Částka
       const transactionId = t.column22 ? t.column22.value : null;
-      const vs = t.column8 ? t.column8.value : null; // Číselný VS
+      const vs = t.column8 ? t.column8.value : null;
       const amount = t.column1 ? t.column1.value : 0;
 
       if (vs && transactionId && !db.processedTransactions.includes(transactionId)) {
-        // Najdeme hráče podle jeho číselného VS
+        // Najdeme hráče podle vs_id
         const playerName = Object.keys(db.players).find(name => db.players[name].vs_id == vs);
 
         if (playerName) {
           db.players[playerName].credits += Math.floor(amount);
           db.processedTransactions.push(transactionId);
-          console.log(`✅ PLATBA: Hráč ${playerName} (VS: ${vs}) +${amount} mincí.`);
+          console.log(`✅ PŘIPSÁNO: Hráč ${playerName} (VS: ${vs}) získal ${amount} $SNAKE.`);
           changeMade = true;
+        } else {
+          console.log(`ℹ️ Přišla platba s VS ${vs}, ale tento VS nepatří žádnému hráči.`);
         }
       }
     });
 
     if (changeMade) saveData(db);
   } catch (error) {
-    console.error("❌ Chyba banky:", error.message);
+    if (error.response && error.response.status === 409) {
+      console.log("❌ Fio API: Chyba 409 (Příliš časté dotazy). Interval 120s je nutný.");
+    } else {
+      console.error("❌ Chyba banky:", error.message);
+    }
   }
 }
 
-// Kontrola každých 60 vteřin
-setInterval(checkFioBank, 60000);
+// --- INTERVAL ---
+// Fio banka vyžaduje rozestup mezi dotazy aspoň 30-60 sekund.
+// Nastavujeme 120 sekund (2 minuty) pro jistotu stabilitu na Renderu.
+setInterval(checkFioBank, 120000);
 
 // --- API CESTY ---
 
-app.get("/", (req, res) => res.send("Snake Backend (Numeric VS) is online! 🚀"));
+app.get("/", (req, res) => {
+  res.send("Snake Backend (Numeric VS) je online! 🚀 Sleduji Fio banku každé 2 minuty.");
+});
 
-// Získání nebo vytvoření hráče
+// Získání hráče nebo vytvoření nového
 app.get("/player/:id", (req, res) => {
   const name = req.params.id;
 
@@ -86,7 +107,7 @@ app.get("/player/:id", (req, res) => {
       vs_id: db.lastVsId
     };
     saveData(db);
-    console.log(`🆕 Nový hráč: ${name} s VS: ${db.lastVsId}`);
+    console.log(`🆕 Registrace: ${name} dostal VS: ${db.lastVsId}`);
   }
 
   res.json({
@@ -96,10 +117,12 @@ app.get("/player/:id", (req, res) => {
   });
 });
 
-// Debug cesta - uvidíš stav celé databáze
+// Debug pro tebe (uvidíš všechna data v prohlížeči)
 app.get("/debug/db", (req, res) => res.json(db));
 
+// Spuštění
 app.listen(PORT, () => {
   console.log(`🚀 Server běží na portu ${PORT}`);
+  // První kontrola proběhne hned po startu
   checkFioBank();
 });
