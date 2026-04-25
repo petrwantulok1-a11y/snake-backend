@@ -10,7 +10,26 @@ app.use(express.json());
 const PORT = process.env.PORT || 10000;
 const DATA_FILE = "database.json";
 
-// Pomocná funkce pro databázi
+// --- POMOCNÉ FUNKCE ---
+
+function generateIban(accountNumber, bankCode) {
+  // Rozdělení na prefix a číslo
+  const parts = accountNumber.split('-');
+  const prefix = parts.length > 1 ? parts[0].padStart(6, '0') : '000000';
+  const number = (parts.length > 1 ? parts[1] : parts[0]).padStart(10, '0');
+  const bank = bankCode.padStart(4, '0');
+  
+  // Výpočet kontrolního čísla (CZ = 1235)
+  // Formát pro výpočet: BankCode + Prefix + Number + 1235 + 00
+  const checkString = `${bank}${prefix}${number}123500`;
+  
+  // Modulo 97 pomocí BigInt (protože číslo je obrovské)
+  const checksum = 98n - (BigInt(checkString) % 97n);
+  const cd = checksum.toString().padStart(2, '0');
+  
+  return `CZ${cd}${bank}${prefix}${number}`;
+}
+
 function loadData() {
   if (!fs.existsSync(DATA_FILE)) return { players: {}, processedTransactions: [], lastVsId: 888000000 };
   try { return JSON.parse(fs.readFileSync(DATA_FILE)); } catch (e) { return { players: {}, processedTransactions: [], lastVsId: 888000000 }; }
@@ -19,7 +38,7 @@ function saveData(data) { fs.writeFileSync(DATA_FILE, JSON.stringify(data, null,
 
 let db = loadData();
 
-// Polling banky (Fio)
+// --- BANKOVNÍ LOGIKA ---
 async function checkFioBank() {
   const FIO_TOKEN = process.env.FIO_TOKEN;
   if (!FIO_TOKEN) return;
@@ -46,12 +65,13 @@ async function checkFioBank() {
       }
     });
     if (changeMade) saveData(db);
-  } catch (e) { console.log("🔍 Čekám na banku..."); }
+  } catch (e) { console.log("🔍 Banka odpočívá..."); }
 }
 setInterval(checkFioBank, 60000);
 
-// API CESTY
-app.get("/", (req, res) => res.send("Backend jede! 🚀"));
+// --- API CESTY ---
+
+app.get("/", (req, res) => res.send("Backend jede a počítá IBAN! 🏦"));
 
 app.get("/player/:id", (req, res) => {
   const name = req.params.id;
@@ -63,7 +83,6 @@ app.get("/player/:id", (req, res) => {
   res.json(db.players[name]);
 });
 
-// TENTO BOD OPRAVÍ CHYBU 404
 app.post("/create-payment", (req, res) => {
   const player_id = req.body.player_id || req.body.hráč_id;
   const amount = req.body.amount || req.body.množství;
@@ -73,13 +92,26 @@ app.post("/create-payment", (req, res) => {
   if (!player) return res.status(404).json({ error: "Hráč nenalezen" });
 
   const vs = player.vs_id;
-  const qrString = `SPD*1.0*ACC:28034926852010*AM:${amount}*CC:CZK*X-VS:${vs}*MSG:SnakeCoin`;
-  res.json({ qrString, vs, account: "2803492685/2010" });
+  const accountNo = "2803492685";
+  const bankCode = "2010";
+  
+  // TADY JE TA OPRAVA: Generujeme IBAN přímo pro QR kód
+  const iban = generateIban(accountNo, bankCode);
+  const qrString = `SPD*1.0*ACC:${iban}*AM:${amount}*CC:CZK*X-VS:${vs}*MSG:SnakeCoin`;
+
+  console.log(`🎫 Generuji IBAN platbu: ${iban} (VS: ${vs})`);
+
+  res.json({ 
+    qrString, 
+    vs, 
+    account: `${accountNo}/${bankCode}`,
+    iban: iban 
+  });
 });
 
 app.get("/debug/db", (req, res) => res.json(db));
 
 app.listen(PORT, () => {
-  console.log(`🚀 Server start na ${PORT}`);
+  console.log(`🚀 Server startuje na ${PORT}`);
   checkFioBank();
 });
