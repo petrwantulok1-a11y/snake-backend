@@ -20,34 +20,34 @@ let db = loadData();
 
 async function checkFioBank() {
   const FIO_TOKEN = process.env.FIO_TOKEN;
-  if (!FIO_TOKEN) return console.log("❌ Chybí TOKEN!");
+  if (!FIO_TOKEN) return console.log("❌ Chybí TOKEN v nastavení Renderu!");
 
   try {
-    // Koukneme se na včerejšek i dnešek (pro jistotu kvůli časovým pásmům)
     const d = new Date();
     const today = d.toISOString().split('T')[0];
-    d.setDate(d.getDate() - 1);
-    const yesterday = d.toISOString().split('T')[0];
+    d.setDate(d.getDate() - 7); // Koukneme týden zpátky
+    const weekAgo = d.toISOString().split('T')[0];
 
-    console.log(`🔍 DEBUG: Kontroluji období od ${yesterday} do ${today}`);
+    console.log(`🔍 DIAGNÓZA: Kontroluji účet od ${weekAgo} do ${today}`);
     
-    const url = `https://www.fio.cz/ib_api/rest/periods/${FIO_TOKEN}/${yesterday}/${today}/transactions.json`;
+    const url = `https://www.fio.cz/ib_api/rest/periods/${FIO_TOKEN}/${weekAgo}/${today}/transactions.json`;
     const response = await axios.get(url);
     
-    // --- TADY JE TEN DEBUG VÝPIS ---
     if (response.data && response.data.accountStatement) {
+        const info = response.data.accountStatement.info;
         const transList = response.data.accountStatement.transactionList;
-        const count = transList && transList.transaction ? transList.transaction.length : 0;
-        console.log(`📊 Banka vrátila ${count} transakcí.`);
         
-        // Pokud tam něco je, vypíšeme to do logu pro kontrolu
+        // VYPÍŠEME ČÍSLO ÚČTU PRO KONTROLU
+        console.log(`🏦 API je napojeno na účet: ${info.accountId} (Zůstatek: ${info.closingBalance} ${info.currency})`);
+        
+        const count = transList && transList.transaction ? transList.transaction.length : 0;
+        console.log(`📊 Počet nalezených transakcí v historii: ${count}`);
+        
         if (count > 0) {
-            console.log("👀 Seznam VS v bance:", transList.transaction.map(t => t.column8 ? t.column8.value : "bez VS"));
+            const lastThree = transList.transaction.slice(-3);
+            console.log("👀 Poslední 3 VS v historii:", lastThree.map(t => t.column8 ? t.column8.value : "bez VS"));
         }
-    } else {
-        console.log("❓ Divná odpověď z banky (chybí accountStatement)");
     }
-    // ------------------------------
 
     const transactions = response.data.accountStatement.transactionList.transaction;
     if (!transactions) return;
@@ -63,7 +63,7 @@ async function checkFioBank() {
         if (playerName) {
           db.players[playerName].credits += Math.floor(amount);
           db.processedTransactions.push(transactionId);
-          console.log(`✅ ÚSPĚCH: Hráč ${playerName} dostal ${amount} mincí.`);
+          console.log(`💰 PŘIPSÁNO: ${playerName} +${amount}`);
           changeMade = true;
         }
       }
@@ -71,11 +71,10 @@ async function checkFioBank() {
 
     if (changeMade) saveData(db);
   } catch (error) {
-    console.log("❌ Chyba banky:", error.message);
+    console.log("❌ Chyba spojení:", error.message);
   }
 }
 
-// Necháme 60 vteřin
 setInterval(checkFioBank, 60000);
 
 app.get("/player/:id", (req, res) => {
@@ -91,6 +90,6 @@ app.get("/player/:id", (req, res) => {
 app.get("/debug/db", (req, res) => res.json(db));
 
 app.listen(PORT, () => {
-  console.log(`🚀 Deep Debug Server Start`);
+  console.log(`🚀 Diagnostický server běží...`);
   checkFioBank();
 });
