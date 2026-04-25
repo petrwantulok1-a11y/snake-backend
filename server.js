@@ -1,95 +1,89 @@
 const express = require("express");
-const fs = require("fs");
 const axios = require("axios");
-const cors = require("cors");
+const fs = require("fs");
 
 const app = express();
-app.use(cors());
-app.use(express.json());
 
-const PORT = process.env.PORT || 10000;
-const DATA_FILE = "database.json";
+const PORT = process.env.PORT || 3000;
 
-function loadData() {
-  if (!fs.existsSync(DATA_FILE)) return { players: {}, processedTransactions: [], lastVsId: 888000000 };
-  try { return JSON.parse(fs.readFileSync(DATA_FILE)); } catch (e) { return { players: {}, processedTransactions: [], lastVsId: 888000000 }; }
+// 🔑 Fio token
+const FIO_TOKEN = process.env.FIO_TOKEN;
+
+// 🔗 Fio API (poslední dny)
+const ACCOUNT_URL = `https://fioapi.fio.cz/v1/rest/periods/${FIO_TOKEN}/2026-04-20/2026-04-30/transactions.json`;
+
+const PLAYERS_FILE = "players.json";
+const PROCESSED_FILE = "processed.json";
+
+// načtení
+function load(file, fallback) {
+  if (!fs.existsSync(file)) return fallback;
+  return JSON.parse(fs.readFileSync(file));
 }
-function saveData(data) { fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2)); }
 
-let db = loadData();
+// uložení
+function save(file, data) {
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
 
-async function checkFioBank() {
-  const FIO_TOKEN = process.env.FIO_TOKEN;
-  if (!FIO_TOKEN) return console.log("❌ Chybí TOKEN v nastavení Renderu!");
+let players = load(PLAYERS_FILE, {});
+let processed = load(PROCESSED_FILE, []);
 
+
+// 🔥 hlavní funkce
+app.get("/check-payments", async (req, res) => {
   try {
-    const d = new Date();
-    const today = d.toISOString().split('T')[0];
-    d.setDate(d.getDate() - 7); // Koukneme týden zpátky
-    const weekAgo = d.toISOString().split('T')[0];
+    const response = await axios.get(ACCOUNT_URL);
 
-    console.log(`🔍 DIAGNÓZA: Kontroluji účet od ${weekAgo} do ${today}`);
-    
-    const url = `https://www.fio.cz/ib_api/rest/periods/${FIO_TOKEN}/${weekAgo}/${today}/transactions.json`;
-    const response = await axios.get(url);
-    
-    if (response.data && response.data.accountStatement) {
-        const info = response.data.accountStatement.info;
-        const transList = response.data.accountStatement.transactionList;
-        
-        // VYPÍŠEME ČÍSLO ÚČTU PRO KONTROLU
-        console.log(`🏦 API je napojeno na účet: ${info.accountId} (Zůstatek: ${info.closingBalance} ${info.currency})`);
-        
-        const count = transList && transList.transaction ? transList.transaction.length : 0;
-        console.log(`📊 Počet nalezených transakcí v historii: ${count}`);
-        
-        if (count > 0) {
-            const lastThree = transList.transaction.slice(-3);
-            console.log("👀 Poslední 3 VS v historii:", lastThree.map(t => t.column8 ? t.column8.value : "bez VS"));
-        }
+    const transactions =
+      response.data.accountStatement.transactionList.transaction;
+
+    let added = 0;
+
+    for (let tx of transactions) {
+      const id = tx.column22.value; // ID transakce
+
+      if (processed.includes(id)) continue;
+
+      const amount = tx.column1.value;
+      const vs = tx.column5?.value;
+
+      if (!vs) continue;
+
+      // 👉 přičti hráči podle VS
+      if (!players[vs]) players[vs] = 0;
+
+      players[vs] += amount;
+      added++;
+
+      processed.push(id);
     }
 
-    const transactions = response.data.accountStatement.transactionList.transaction;
-    if (!transactions) return;
+    save(PLAYERS_FILE, players);
+    save(PROCESSED_FILE, processed);
 
-    let changeMade = false;
-    transactions.forEach(t => {
-      const transactionId = t.column22 ? t.column22.value : null;
-      const vs = t.column8 ? t.column8.value : null;
-      const amount = t.column1 ? t.column1.value : 0;
-
-      if (vs && transactionId && !db.processedTransactions.includes(transactionId)) {
-        const playerName = Object.keys(db.players).find(name => db.players[name].vs_id == vs);
-        if (playerName) {
-          db.players[playerName].credits += Math.floor(amount);
-          db.processedTransactions.push(transactionId);
-          console.log(`💰 PŘIPSÁNO: ${playerName} +${amount}`);
-          changeMade = true;
-        }
-      }
+    res.json({
+      added,
+      players
     });
 
-    if (changeMade) saveData(db);
-  } catch (error) {
-    console.log("❌ Chyba spojení:", error.message);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Chyba při načítání plateb" });
   }
-}
-
-setInterval(checkFioBank, 60000);
-
-app.get("/player/:id", (req, res) => {
-  const name = req.params.id;
-  if (!db.players[name]) {
-    db.lastVsId += 1;
-    db.players[name] = { credits: 0, vs_id: db.lastVsId };
-    saveData(db);
-  }
-  res.json(db.players[name]);
 });
 
-app.get("/debug/db", (req, res) => res.json(db));
+
+// 🔥 získání kreditu
+app.get("/player/:id", (req, res) => {
+  const id = req.params.id;
+
+  res.json({
+    credits: players[id] || 0
+  });
+});
+
 
 app.listen(PORT, () => {
-  console.log(`🚀 Diagnostický server běží...`);
-  checkFioBank();
+  console.log("Server běží na portu " + PORT);
 });
