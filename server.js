@@ -1,197 +1,123 @@
-import express from 'express';
-import cors from 'cors';
-import fetch from 'node-fetch';
-import { createClient } from '@supabase/supabase-js';
+const express = require("express");
+const fs = require("fs");
+const axios = require("axios");
+const cors = require("cors");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 🔐 ENV
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY; // service_role!
-const FIO_TOKEN = process.env.FIO_TOKEN;
+const PORT = process.env.PORT || 10000;
+const DATA_FILE = "database.json";
 
-if (!SUPABASE_URL || !SUPABASE_KEY || !FIO_TOKEN) {
-  console.error("❌ Missing ENV variables");
+// --- POMOCNÉ FUNKCE ---
+function generateIban(accountNumber, bankCode) {
+  const parts = accountNumber.split('-');
+  const prefix = parts.length > 1 ? parts[0].padStart(6, '0') : '000000';
+  const number = (parts.length > 1 ? parts[1] : parts[0]).padStart(10, '0');
+  const bank = bankCode.padStart(4, '0');
+  
+  const checkString = `${bank}${prefix}${number}123500`;
+  const checksum = 98n - (BigInt(checkString) % 97n);
+  const cd = checksum.toString().padStart(2, '0');
+  
+  return `CZ${cd}${bank}${prefix}${number}`;
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+function loadData() {
+  if (!fs.existsSync(DATA_FILE)) return { players: {}, processedTransactions: [], lastVsId: 888000000 };
+  try { return JSON.parse(fs.readFileSync(DATA_FILE)); } catch (e) { return { players: {}, processedTransactions: [], lastVsId: 888000000 }; }
+}
+function saveData(data) { fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2)); }
 
-const SNAKE_PER_CZK = 1;
+let db = loadData();
 
-// ─────────────────────────────
-// 🧑‍💻 GET /player/:id
-// ─────────────────────────────
-app.get('/player/:id', async (req, res) => {
-  const playerId = req.params.id;
-
-  let { data: player, error } = await supabase
-    .from('players')
-    .select('id, credits, vs_id')
-    .eq('id', playerId)
-    .single();
-
-  if (error && error.code === 'PGRST116') {
-    const vs_id = Date.now();
-
-    const { data: newPlayer, error: insertErr } = await supabase
-      .from('players')
-      .insert({ id: playerId, credits: 0, vs_id })
-      .select()
-      .single();
-
-    if (insertErr) {
-      return res.status(500).json({ error: insertErr.message });
-    }
-
-    player = newPlayer;
-  } else if (error) {
-    return res.status(500).json({ error: error.message });
+// --- BANKOVNÍ LOGIKA (Odolná proti restartu a čistě anglicky) ---
+async function checkFioBank() {
+  const FIO_TOKEN = process.env.FIO_TOKEN;
+  if (!FIO_TOKEN) {
+    console.log("⚠️ Chyba: Chybi FIO_TOKEN v promennych prostredi!");
+    return;
   }
 
-  res.json({
-    player: player.id,
-    credits: player.credits ?? 0,
-    vs_id: player.vs_id,
+  try {
+    const today = new Date().toISOString().split('T')[0]; 
+    const url = `https://www.fio.cz/ib_api/rest/periods/${FIO_TOKEN}/${today}/${today}/transactions.json`;
+    
+    const response = await axios.get(url);
+    const transactions = response.data.accountStatement.transactionList.transaction;
+    
+    if (!transactions) return;
+
+    let changeMade = false;
+    transactions.forEach(t => {
+      const vs = t.column8 ? t.column8.value : null; 
+      const amount = t.column1 ? t.column1.value : 0; 
+      const tid = t.column22 ? t.column22.value : null; 
+
+      if (vs && tid && !db.processedTransactions.includes(tid)) {
+        const playerName = Object.keys(db.players).find(name => db.players[name].vs_id == vs);
+        
+        if (playerName) {
+          db.players[playerName].credits += Math.floor(amount);
+          db.processedTransactions.push(tid);
+          console.log(`✅ PRIPSANO: ${playerName} dostal ${amount} minci! (VS: ${vs})`);
+          changeMade = true;
+        }
+      }
+    });
+    
+    if (changeMade) saveData(db);
+    
+  } catch (e) { 
+    console.log("🔍 Cekam na banku (API limit nebo udrzba)..."); 
+  }
+}
+
+setInterval(checkFioBank, 60000);
+
+// --- API CESTY ---
+app.get("/", (req, res) => res.send("Backend jede jako hodinky! 🚀"));
+
+app.get("/player/:id", (req, res) => {
+  const name = req.params.id;
+  if (!db.players[name]) {
+    db.lastVsId += 1;
+    db.players[name] = { credits: 0, vs_id: db.lastVsId };
+    saveData(db);
+    console.log(`👤 Novy hrac: ${name} (VS: ${db.lastVsId})`);
+  }
+  res.json(db.players[name]);
+});
+
+app.post("/create-payment", (req, res) => {
+  const player_id = req.body.player_id;
+  const amount = req.body.amount;
+
+  if (!player_id) return res.status(400).json({ error: "Chybi player_id" });
+  const player = db.players[player_id];
+  if (!player) return res.status(404).json({ error: "Hrac nenalezen" });
+
+  const vs = player.vs_id;
+  const accountNo = "2803492685";
+  const bankCode = "2010";
+  
+  const iban = generateIban(accountNo, bankCode);
+  const qrString = `SPD*1.0*ACC:${iban}*AM:${amount}*CC:CZK*X-VS:${vs}*MSG:SnakeCoin`;
+
+  console.log(`🎫 Hrac ${player_id} generuje platbu na ${amount} (VS: ${vs})`);
+
+  res.json({ 
+    qrString, 
+    vs, 
+    account: `${accountNo}/${bankCode}`,
+    iban: iban 
   });
 });
 
-// ─────────────────────────────
-// 💸 POST /create-payment
-// ─────────────────────────────
-app.post('/create-payment', async (req, res) => {
-  const { player_id, amount } = req.body;
-
-  if (!player_id || !amount) {
-    return res.status(400).json({ error: 'Missing player_id or amount' });
-  }
-
-  const vs = String(Date.now());
-
-  const qrString = `SPD*1.0*ACC:2803492685/2010*AM:${amount}*CC:CZK*X-VS:${vs}`;
-
-  const { error } = await supabase.from('payments').insert({
-    player_id,
-    vs,
-    amount,
-    paid: false,
-  });
-
-  if (error) {
-    return res.status(500).json({ error: error.message });
-  }
-
-  res.json({ vs, qrString, amount });
-});
-
-// ─────────────────────────────
-// 🔄 GET /check-payments
-// ─────────────────────────────
-app.get('/check-payments', async (req, res) => {
-  try {
-    const r = await fetch(
-      `https://fioapi.fio.cz/v1/rest/last/${FIO_TOKEN}/transactions.json`
-    );
-
-    if (!r.ok) {
-      return res.status(502).json({ error: 'FIO API error' });
-    }
-
-    const data = await r.json();
-    const txs = data?.accountStatement?.transactionList?.transaction || [];
-
-    const credited = [];
-
-    for (const tx of txs) {
-      const vs = tx.column5?.value;
-      const amount = Number(tx.column1?.value);
-
-      if (!vs || !amount || amount <= 0) continue;
-
-      const { data: payment } = await supabase
-        .from('payments')
-        .select('*')
-        .eq('vs', String(vs))
-        .eq('paid', false)
-        .maybeSingle();
-
-      if (!payment) continue;
-
-      const { data: player } = await supabase
-        .from('players')
-        .select('credits')
-        .eq('id', payment.player_id)
-        .single();
-
-      if (!player) continue;
-
-      const add = payment.amount * SNAKE_PER_CZK;
-      const newCredits = (player.credits ?? 0) + add;
-
-      await supabase
-        .from('players')
-        .update({ credits: newCredits })
-        .eq('id', payment.player_id);
-
-      await supabase
-        .from('payments')
-        .update({
-          paid: true,
-          paid_at: new Date().toISOString(),
-        })
-        .eq('id', payment.id);
-
-      credited.push({
-        player_id: payment.player_id,
-        vs: payment.vs,
-        added: add,
-      });
-    }
-
-    res.json({ ok: true, credited });
-  } catch (err) {
-    console.error("❌ check-payments error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─────────────────────────────
-// 🔁 AUTO CHECK každých 30s
-// ─────────────────────────────
-setInterval(async () => {
-  try {
-    const r = await fetch(
-      `http://localhost:${process.env.PORT || 3000}/check-payments`
-    );
-    const j = await r.json();
-
-    if (j.credited?.length) {
-      console.log("💰 credited:", j.credited);
-    }
-  } catch (e) {
-    console.error("Auto check error:", e.message);
-  }
-}, 30000);
-
-// ─────────────────────────────
-// 🚀 START SERVER
-// ─────────────────────────────
-const PORT = process.env.PORT || 3000;
+app.get("/debug/db", (req, res) => res.json(db));
 
 app.listen(PORT, () => {
-  console.log("🚀 Server running on port", PORT);
-  console.log("SUPABASE:", !!SUPABASE_URL);
-  console.log("FIO:", !!FIO_TOKEN);
-});
-
-// ─────────────────────────────
-// 🛑 SAFE GUARDS
-// ─────────────────────────────
-process.on('uncaughtException', (err) => {
-  console.error('UNCAUGHT:', err);
-});
-
-process.on('unhandledRejection', (err) => {
-  console.error('UNHANDLED:', err);
+  console.log(`🚀 Server odstartoval na portu ${PORT}`);
+  checkFioBank(); 
 });
