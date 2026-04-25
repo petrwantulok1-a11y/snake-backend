@@ -1,134 +1,193 @@
-const express = require("express");
-const fs = require("fs");
-const axios = require("axios");
-const cors = require("cors");
+import express from "express";
+import cors from "cors";
+import fetch from "node-fetch";
+import { createClient } from "@supabase/supabase-js";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 10000;
-const DATA_FILE = "database.json";
+// 🔑 ENV
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY; // service_role!
+const FIO_TOKEN = process.env.FIO_TOKEN;
 
-// --- POMOCNÉ FUNKCE ---
-function generateIban(accountNumber, bankCode) {
-  // Rozdělení na prefix a číslo
-  const parts = accountNumber.split('-');
-  const prefix = parts.length > 1 ? parts[0].padStart(6, '0') : '000000';
-  const number = (parts.length > 1 ? parts[1] : parts[0]).padStart(10, '0');
-  const bank = bankCode.padStart(4, '0');
-  
-  // Výpočet kontrolního čísla (CZ = 1235)
-  const checkString = `${bank}${prefix}${number}123500`;
-  const checksum = 98n - (BigInt(checkString) % 97n);
-  const cd = checksum.toString().padStart(2, '0');
-  
-  return `CZ${cd}${bank}${prefix}${number}`;
-}
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-function loadData() {
-  if (!fs.existsSync(DATA_FILE)) return { players: {}, processedTransactions: [], lastVsId: 888000000 };
-  try { return JSON.parse(fs.readFileSync(DATA_FILE)); } catch (e) { return { players: {}, processedTransactions: [], lastVsId: 888000000 }; }
-}
-function saveData(data) { fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2)); }
+const SNAKE_PER_CZK = 1;
 
-let db = loadData();
+// ─────────────────────────────────────────
+// PLAYER
+// ─────────────────────────────────────────
+app.get("/player/:id", async (req, res) => {
+  const playerId = req.params.id;
 
-// --- BANKOVNÍ LOGIKA (Konečně odolná proti restartu) ---
-async function checkFioBank() {
-  const FIO_TOKEN = process.env.FIO_TOKEN;
-  if (!FIO_TOKEN) {
-    console.log("⚠️ Chybí FIO_TOKEN v proměnných prostředí!");
-    return;
+  let { data: player, error } = await supabase
+    .from("players")
+    .select("*")
+    .eq("id", playerId)
+    .single();
+
+  if (error && error.code === "PGRST116") {
+    const { data: newPlayer, error: insertErr } = await supabase
+      .from("players")
+      .insert({
+        id: playerId,
+        credits: 0,
+      })
+      .select()
+      .single();
+
+    if (insertErr) return res.status(500).json({ error: insertErr.message });
+
+    player = newPlayer;
   }
 
-  try {
-    // Fígl: Ptáme se na celý dnešní den, takže server po restartu "nezapomene" platby
-    const today = new Date().toISOString().split('T')[0]; 
-    const url = `https://www.fio.cz/ib_api/rest/periods/${FIO_TOKEN}/${today}/${today}/transactions.json`;
-    
-    const response = await axios.get(url);
-    const transactions = response.data.accountStatement.transactionList.transaction;
-    
-    if (!transactions) return;
-
-    let changeMade = false;
-    transactions.forEach(t => {
-      const vs = t.column8 ? t.column8.value : null; // Variabilní symbol
-      const amount = t.column1 ? t.column1.value : 0; // Částka
-      const tid = t.column22 ? t.column22.value : null; // ID transakce
-
-      // Pokud platba existuje a ještě jsme ji nezpracovali
-      if (vs && tid && !db.processedTransactions.includes(tid)) {
-        // Najdeme hráče s tímto VS
-        const playerName = Object.keys(db.players).find(name => db.players[name].vs_id == vs);
-        
-        if (playerName) {
-          db.players[playerName].credits += Math.floor(amount);
-          db.processedTransactions.push(tid);
-          console.log(`✅ PŘIPSÁNO: ${playerName} dostal ${amount} mincí! (VS: ${vs})`);
-          changeMade = true;
-        }
-      }
-    });
-    
-    if (changeMade) saveData(db);
-    
-  } catch (e) { 
-    // Pokud banka zrovna neodpovídá, tiše mlčíme a zkusíme to za minutu znovu
-    console.log("🔍 Čekám na banku (API limit nebo údržba)..."); 
-  }
-}
-
-// Kontrolujeme banku každou minutu (60000 ms)
-setInterval(checkFioBank, 60000);
-
-// --- API CESTY ---
-app.get("/", (req, res) => res.send("Backend jede jako hodinky! 🚀"));
-
-// Získání hráče (pokud neexistuje, vytvoříme ho s novým VS)
-app.get("/player/:id", (req, res) => {
-  const name = req.params.id;
-  if (!db.players[name]) {
-    db.lastVsId += 1;
-    db.players[name] = { credits: 0, vs_id: db.lastVsId };
-    saveData(db);
-    console.log(`👤 Nový hráč: ${name} (VS: ${db.lastVsId})`);
-  }
-  res.json(db.players[name]);
-});
-
-// Vytvoření platby pro UI a vygenerování QR kódu
-app.post("/create-payment", (req, res) => {
-  const player_id = req.body.player_id;
-  const amount = req.body.amount;
-
-  if (!player_id) return res.status(400).json({ error: "Chybí player_id" });
-  const player = db.players[player_id];
-  if (!player) return res.status(404).json({ error: "Hráč nenalezen (zavolejte nejdřív GET /player/jmeno)" });
-
-  const vs = player.vs_id;
-  const accountNo = "2803492685";
-  const bankCode = "2010";
-  
-  const iban = generateIban(accountNo, bankCode);
-  const qrString = `SPD*1.0*ACC:${iban}*AM:${amount}*CC:CZK*X-VS:${vs}*MSG:SnakeCoin`;
-
-  console.log(`🎫 Hráč ${player_id} chce koupit ${amount} mincí. Generuji platbu (VS: ${vs})`);
-
-  res.json({ 
-    qrString, 
-    vs, 
-    account: `${accountNo}/${bankCode}`,
-    iban: iban 
+  res.json({
+    player: player.id,
+    credits: player.credits || 0,
   });
 });
 
-// Debug výpis celé databáze
-app.get("/debug/db", (req, res) => res.json(db));
+// ─────────────────────────────────────────
+// CREATE PAYMENT
+// ─────────────────────────────────────────
+app.post("/create-payment", async (req, res) => {
+  try {
+    const { player_id, amount } = req.body;
 
-// --- SPUŠTĚNÍ SERVERU ---
-app.listen(PORT, () => {
-  console.log(`🚀 Server odstartoval na portu ${PORT}`);
-  checkFioBank(); // Zkusíme se mrknout do banky hned po startu
+    if (!player_id || !amount) {
+      return res.status(400).json({ error: "Missing data" });
+    }
+
+    const vs = String(Date.now());
+
+    const qrString = `SPD*1.0*ACC:2803492685/2010*AM:${amount}*CC:CZK*X-VS:${vs}`;
+
+    const { error } = await supabase.from("payments").insert({
+      player_id,
+      vs,
+      amount,
+      paid: false,
+    });
+
+    if (error) {
+      console.error("DB INSERT ERROR:", error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    console.log("CREATED PAYMENT:", { player_id, vs, amount });
+
+    res.json({ vs, qrString, amount });
+  } catch (e) {
+    console.error("CREATE ERROR:", e);
+    res.status(500).json({ error: e.message });
+  }
 });
+
+// ─────────────────────────────────────────
+// CHECK PAYMENTS (FIO)
+// ─────────────────────────────────────────
+app.get("/check-payments", async (req, res) => {
+  try {
+    const from = new Date(Date.now() - 2 * 86400000)
+      .toISOString()
+      .split("T")[0];
+
+    const to = new Date().toISOString().split("T")[0];
+
+    const url = `https://fioapi.fio.cz/v1/rest/periods/${FIO_TOKEN}/${from}/${to}/transactions.json`;
+
+    const r = await fetch(url);
+
+    if (!r.ok) {
+      return res.status(500).json({ error: "FIO API ERROR" });
+    }
+
+    const json = await r.json();
+
+    const txs =
+      json?.accountStatement?.transactionList?.transaction || [];
+
+    const credited = [];
+
+    for (const tx of txs) {
+      const vs =
+        tx.column5?.value ||
+        tx.column22?.value ||
+        null;
+
+      const amount = Number(tx.column1?.value);
+
+      if (!vs || !amount || amount <= 0) continue;
+
+      console.log("TX:", { vs, amount });
+
+      const { data: payment } = await supabase
+        .from("payments")
+        .select("*")
+        .eq("vs", String(vs))
+        .eq("paid", false)
+        .maybeSingle();
+
+      if (!payment) continue;
+
+      const { data: player } = await supabase
+        .from("players")
+        .select("credits")
+        .eq("id", payment.player_id)
+        .single();
+
+      const add = payment.amount * SNAKE_PER_CZK;
+      const newCredits = (player.credits || 0) + add;
+
+      await supabase
+        .from("players")
+        .update({ credits: newCredits })
+        .eq("id", payment.player_id);
+
+      await supabase
+        .from("payments")
+        .update({
+          paid: true,
+          paid_at: new Date().toISOString(),
+        })
+        .eq("id", payment.id);
+
+      credited.push({
+        player_id: payment.player_id,
+        vs,
+        added: add,
+      });
+
+      console.log("CREDITED:", payment.player_id, add);
+    }
+
+    res.json({ ok: true, credited });
+  } catch (e) {
+    console.error("CHECK ERROR:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────
+// AUTO CHECK (každých 30s)
+// ─────────────────────────────────────────
+setInterval(async () => {
+  try {
+    const r = await fetch(
+      `http://localhost:${process.env.PORT || 3000}/check-payments`
+    );
+    const j = await r.json();
+
+    if (j.credited?.length) {
+      console.log("AUTO CREDIT:", j.credited);
+    }
+  } catch (e) {
+    console.error("AUTO ERROR:", e.message);
+  }
+}, 30000);
+
+// ─────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("RUNNING ON", PORT));
