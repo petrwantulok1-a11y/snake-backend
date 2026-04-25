@@ -1,13 +1,13 @@
 import express from "express";
 import cors from "cors";
-import axios from "axios";
+import fetch from "node-fetch";
 import { createClient } from "@supabase/supabase-js";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// === ENV ===
+// ===== ENV =====
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
@@ -15,23 +15,37 @@ const supabase = createClient(
 
 const FIO_TOKEN = process.env.FIO_TOKEN;
 
-// === NAČTENÍ PLATEB Z FIO ===
+// ===== FIO API =====
 async function fetchNewBankPayments() {
-  const url = `https://fioapi.fio.cz/v1/rest/periods/${FIO_TOKEN}/2026-04-01/2026-04-30/transactions.json`;
+  const token = FIO_TOKEN;
 
-  const response = await axios.get(url);
+  if (!token) {
+    console.error("❌ FIO_TOKEN není nastaven");
+    return [];
+  }
 
-  const transactions =
-    response.data.accountStatement.transactionList.transaction || [];
+  try {
+    const url = `https://www.fio.cz/ib_api/rest/last/${token}/transactions.json`;
 
-  return transactions.map((t) => ({
-    id: t.column22.value, // ID transakce
-    amount: Number(t.column1.value), // částka
-    variableSymbol: t.column5?.value || null,
-  }));
+    const response = await fetch(url);
+    const json = await response.json();
+
+    const transactions =
+      json?.accountStatement?.transactionList?.transaction || [];
+
+    return transactions.map((t) => ({
+      id: t.column22?.value,               // ID transakce
+      amount: Number(t.column1?.value),   // částka
+      variableSymbol: t.column5?.value,   // VS
+    }));
+
+  } catch (err) {
+    console.error("❌ Fio fetch error:", err.message);
+    return [];
+  }
 }
 
-// === PŘIČTENÍ KREDITŮ ===
+// ===== PŘIČTENÍ KREDITŮ =====
 async function addCreditsToPlayer(playerId, amount) {
   const { data: existing } = await supabase
     .from("players")
@@ -49,7 +63,7 @@ async function addCreditsToPlayer(playerId, amount) {
   if (error) throw new Error(error.message);
 }
 
-// === GET PLAYER ===
+// ===== GET PLAYER =====
 app.get("/player/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -60,33 +74,37 @@ app.get("/player/:id", async (req, res) => {
       .eq("id", id)
       .maybeSingle();
 
-    // pokud neexistuje → vytvoř
+    // pokud hráč neexistuje → vytvoř
     if (!data) {
       const vs_id = 888000000 + Math.floor(Math.random() * 999999);
 
-      const { data: created } = await supabase
+      const { data: created, error } = await supabase
         .from("players")
         .insert({ id, credits: 0, vs_id })
         .select()
         .single();
+
+      if (error) throw new Error(error.message);
 
       return res.json(created);
     }
 
     res.json(data);
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// === CHECK PAYMENTS ===
+// ===== CHECK PAYMENTS =====
 app.get("/check-payments", async (req, res) => {
   try {
     const payments = await fetchNewBankPayments();
-
     const results = [];
 
     for (const p of payments) {
+      if (!p.variableSymbol) continue;
+
       // už zpracováno?
       const { data: exists } = await supabase
         .from("processed_payments")
@@ -122,14 +140,16 @@ app.get("/check-payments", async (req, res) => {
     }
 
     res.json({ ok: true, processed: results });
+
   } catch (err) {
-    console.error(err);
+    console.error("❌ check-payments error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// === START ===
+// ===== START =====
 const PORT = process.env.PORT || 10000;
+
 app.listen(PORT, () => {
-  console.log("Server běží na portu", PORT);
+  console.log("🚀 Server běží na portu " + PORT);
 });
